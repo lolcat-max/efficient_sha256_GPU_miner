@@ -2,7 +2,7 @@ import pyopencl as cl
 import numpy as np
 import time
 
-# Optimized parallel OpenCL kernel for SHA-256 mining
+# Optimized parallel OpenCL kernel for SHA-256 mining with 64-bit nonce
 opencl_sha256_kernel = """
 // SHA-256 Constants
 __constant uint K[64] = {
@@ -73,20 +73,25 @@ void sha256_transform(uchar *input, int len, uchar *output) {
     }
 }
 
-__kernel void mine_sha256(__global uint *found_nonce, __global uchar *found_hash,
-                          __global int *found_flag, __global uint *stats_buffer,
-                          uint start_nonce, uint target_zeros) {
+__kernel void mine_sha256(__global ulong *found_nonce, 
+                          __global uchar *found_hash, __global int *found_flag, 
+                          __global uint *stats_buffer, uint start_nonce_high, 
+                          uint start_nonce_low, uint target_zeros) {
     int gid = get_global_id(0);
-    uint nonce = start_nonce + gid;
     
-    // Convert nonce to string
-    uchar nonce_str[16];
+    // Combine 64-bit nonce from high and low 32-bit parts
+    ulong base_nonce = ((ulong)start_nonce_high << 32) | (ulong)start_nonce_low;
+    ulong nonce = base_nonce + (ulong)gid;
+    
+    // Convert 64-bit nonce to string
+    uchar nonce_str[24];  // Enough for up to 20 digits + safety
     int len = 0;
-    uint temp = nonce;
+    ulong temp = nonce;
+    
     if (temp == 0) {
         nonce_str[len++] = '0';
     } else {
-        uchar rev[16];
+        uchar rev[24];
         int rev_len = 0;
         while (temp > 0) {
             rev[rev_len++] = '0' + (temp % 10);
@@ -122,15 +127,15 @@ __kernel void mine_sha256(__global uint *found_nonce, __global uchar *found_hash
         if ((byte & 0x0F) == 0) total_zeros++;
     }
     
-    // Update stats atomically (parallel-safe)
-    atomic_max(&stats_buffer[0], leading_zeros);  // max leading zeros
-    atomic_max(&stats_buffer[1], total_zeros);     // max total zeros
-    atomic_add(&stats_buffer[2], leading_zeros);   // sum leading zeros
-    atomic_add(&stats_buffer[3], total_zeros);     // sum total zeros
+    // Update stats atomically
+    atomic_max(&stats_buffer[0], leading_zeros);
+    atomic_max(&stats_buffer[1], total_zeros);
+    atomic_add(&stats_buffer[2], leading_zeros);
+    atomic_add(&stats_buffer[3], total_zeros);
     
     // Check if found target
     if (leading_zeros >= target_zeros) {
-        if (atomic_cmpxchg(found_flag, 0, 1) == 0) {  // First one to find it
+        if (atomic_cmpxchg(found_flag, 0, 1) == 0) {
             *found_nonce = nonce;
             for (int i = 0; i < 32; i++) {
                 found_hash[i] = hash[i];
@@ -140,10 +145,36 @@ __kernel void mine_sha256(__global uint *found_nonce, __global uchar *found_hash
 }
 """
 
-# Configuration
-TARGET_LEADING_ZEROS = 8
-BATCH_SIZE = 1024 * 1024 * 4  # 4M hashes per batch - fully parallel
-PRINT_INTERVAL = 1  # Print every batch
+def split_u64_to_u32(n):
+    """Split 64-bit integer into high and low 32-bit parts"""
+    low = n & 0xFFFFFFFF
+    high = (n >> 32) & 0xFFFFFFFF
+    return high, low
+
+def count_leading_zeros(hex_hash):
+    return len(hex_hash) - len(hex_hash.lstrip('0'))
+
+def count_total_zeros(hex_hash):
+    return hex_hash.count('0')
+
+TARGET_LEADING_ZEROS = 10
+PRINT_INTERVAL = 5000
+BATCH_SIZE = 1024 * 1024  # 1M nonces per GPU batch
+
+attempt = 0
+stats = {
+    "max_zeros": 0,
+    "max_leading_zeros": 0,
+    "total_zeros": 0,
+    "total_leading_zeros": 0,
+}
+
+start_time = time.time()
+
+# Ranged incrementing nonce - now 64-bit!
+domain_min = 1
+domain_max = 10**15  # 1 quadrillion - way beyond 32-bit!
+current_nonce = domain_min
 
 # Initialize OpenCL
 ctx = cl.create_some_context()
@@ -151,44 +182,36 @@ queue = cl.CommandQueue(ctx)
 prg = cl.Program(ctx, opencl_sha256_kernel).build()
 kernel = cl.Kernel(prg, "mine_sha256")
 
-# Persistent buffers (reused across batches for speed)
-found_nonce_buf = cl.Buffer(ctx, cl.mem_flags.READ_WRITE, 4)
+# Persistent buffers - note found_nonce is now 8 bytes (64-bit)
+found_nonce_buf = cl.Buffer(ctx, cl.mem_flags.READ_WRITE, 8)
 found_hash_buf = cl.Buffer(ctx, cl.mem_flags.READ_WRITE, 32)
 found_flag_buf = cl.Buffer(ctx, cl.mem_flags.READ_WRITE, 4)
-stats_buf = cl.Buffer(ctx, cl.mem_flags.READ_WRITE, 16)  # 4 uint stats
+stats_buf = cl.Buffer(ctx, cl.mem_flags.READ_WRITE, 16)
 
-# Global stats
-attempt = 0
-global_stats = {
-    "max_leading_zeros": 0,
-    "max_total_zeros": 0,
-    "total_leading_zeros": 0,
-    "total_total_zeros": 0,
-}
-
-start_time = time.time()
-current_nonce = 1
-batch_count = 0
-
-print(f"Parallel OpenCL SHA-256 Miner")
-print(f"Target: {TARGET_LEADING_ZEROS} leading zeros")
-print(f"Batch size: {BATCH_SIZE:,} hashes (fully parallel)")
+print(f"Starting 64-bit OpenCL SHA-256 miner (Target: {TARGET_LEADING_ZEROS} leading zeros)")
 print(f"Device: {ctx.devices[0].name}")
+print(f"Nonce range: {domain_min:,} to {domain_max:,}")
+print(f"Batch size: {BATCH_SIZE:,} (parallel)")
 print("=" * 70)
 
-while True:
-    batch_count += 1
+while current_nonce <= domain_max:
+    # Calculate batch size (don't exceed domain_max)
+    actual_batch_size = min(BATCH_SIZE, domain_max - current_nonce + 1)
     
-    # Reset found flag for this batch
+    # Reset flags
     cl.enqueue_fill_buffer(queue, found_flag_buf, np.int32(0), 0, 4)
     cl.enqueue_fill_buffer(queue, stats_buf, np.uint32(0), 0, 16)
     
-    # Launch kernel - ALL work happens in parallel on GPU
-    kernel(queue, (BATCH_SIZE,), None,
-           found_nonce_buf, found_hash_buf, found_flag_buf, stats_buf,
-           np.uint32(current_nonce), np.uint32(TARGET_LEADING_ZEROS))
+    # Split 64-bit nonce into high and low 32-bit parts
+    high_nonce, low_nonce = split_u64_to_u32(current_nonce)
     
-    # Only read back minimal data (not all hashes!)
+    # Launch parallel kernel with 64-bit nonce support
+    kernel(queue, (actual_batch_size,), None,
+           found_nonce_buf, found_hash_buf, found_flag_buf, 
+           stats_buf, np.uint32(high_nonce), np.uint32(low_nonce), 
+           np.uint32(TARGET_LEADING_ZEROS))
+    
+    # Read back minimal stats
     found_flag = np.empty(1, dtype=np.int32)
     batch_stats = np.empty(4, dtype=np.uint32)
     
@@ -196,30 +219,30 @@ while True:
     cl.enqueue_copy(queue, batch_stats, stats_buf)
     queue.finish()
     
-    # Update global stats
-    global_stats["max_leading_zeros"] = max(global_stats["max_leading_zeros"], batch_stats[0])
-    global_stats["max_total_zeros"] = max(global_stats["max_total_zeros"], batch_stats[1])
-    global_stats["total_leading_zeros"] += batch_stats[2]
-    global_stats["total_total_zeros"] += batch_stats[3]
+    # Update stats (ORIGINAL LOGIC)
+    stats["max_leading_zeros"] = max(stats["max_leading_zeros"], batch_stats[0])
+    stats["max_zeros"] = max(stats["max_zeros"], batch_stats[1])
+    stats["total_leading_zeros"] += batch_stats[2]
+    stats["total_zeros"] += batch_stats[3]
     
-    attempt += BATCH_SIZE
-    current_nonce += BATCH_SIZE
+    attempt += actual_batch_size
+    current_nonce += actual_batch_size
     
-    # Print stats
-    if batch_count % PRINT_INTERVAL == 0:
+    # Print stats periodically (ORIGINAL LOGIC)
+    if attempt % PRINT_INTERVAL < actual_batch_size or attempt == actual_batch_size:
         elapsed = time.time() - start_time
         hashrate = attempt / elapsed if elapsed > 0 else 0
-        avg_leading = global_stats["total_leading_zeros"] / attempt
-        avg_total = global_stats["total_total_zeros"] / attempt
-        
-        print(f"Batch {batch_count:>4} | Attempts: {attempt:>12,} | Rate: {hashrate:>10,.0f} H/s")
-        print(f"         | Max Leading: {global_stats['max_leading_zeros']:>2} | Max Total: {global_stats['max_total_zeros']:>2} | Avg L: {avg_leading:.2f} | Avg T: {avg_total:.2f}")
+        print(f"Attempts: {attempt:,}, Hashrate: {hashrate:,.0f} hashes/sec")
+        print(f"Max leading zeros: {stats['max_leading_zeros']}")
+        print(f"Max total zeros: {stats['max_zeros']}")
+        print(f"Average leading zeros: {stats['total_leading_zeros'] / attempt:.2f}")
+        print(f"Average total zeros: {stats['total_zeros'] / attempt:.2f}")
+        print(f"Current nonce: {current_nonce:,}")
         print("-" * 70)
     
-    # Check if found
+    # Check if found (ORIGINAL LOGIC)
     if found_flag[0] == 1:
-        # Read back winning data
-        found_nonce = np.empty(1, dtype=np.uint32)
+        found_nonce = np.empty(1, dtype=np.uint64)
         found_hash = np.empty(32, dtype=np.uint8)
         
         cl.enqueue_copy(queue, found_nonce, found_nonce_buf)
@@ -230,7 +253,6 @@ while True:
         hashrate = attempt / elapsed if elapsed > 0 else 0
         hash_hex = ''.join(f'{b:02x}' for b in found_hash)
         
-        # Count zeros for display
         leading_zeros = 0
         for byte in found_hash:
             if byte == 0:
@@ -243,14 +265,15 @@ while True:
         
         total_zeros = hash_hex.count('0')
         
-        print("=" * 70)
-        print(f"🎉 SUCCESS!")
-        print(f"Nonce: {found_nonce[0]}")
-        print(f"Hash: {hash_hex}")
+        print("\n" + "=" * 70)
+        print(f"Success at attempt {attempt:,}!")
+        print(f"Value: {found_nonce[0]}")
+        print(f"SHA-256 Hash: {hash_hex}")
         print(f"Leading zeros: {leading_zeros}")
         print(f"Total zeros: {total_zeros}")
-        print(f"Attempts: {attempt:,}")
-        print(f"Hashrate: {hashrate:,.0f} H/s")
-        print(f"Time: {elapsed:.2f} seconds")
+        print(f"Hashes per second: {hashrate:,.0f}")
         print("=" * 70)
         break
+
+if current_nonce > domain_max:
+    print("Exhausted nonce range without finding solution")
