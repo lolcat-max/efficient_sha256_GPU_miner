@@ -443,8 +443,8 @@ BATCH_SIZE = 1024 * 1024   # 1M nonces per GPU batch
 POOL_ENABLED = True
 POOL_URL = "stratum+tcp://ss.antpool.com"  # Replace with actual Bitcoin pool
 POOL_PORT = 3333
-POOL_USERNAME = "lolcatz.bit"  # Your BTC address
-POOL_WORKER = "opencl_miner_01"
+POOL_USERNAME = "lolcatz"  # Your BTC address
+POOL_WORKER = "bit"
 
 # Initialize mining stats
 attempt = 0
