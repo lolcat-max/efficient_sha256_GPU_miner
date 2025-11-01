@@ -614,9 +614,6 @@ while current_nonce <= domain_max:
         if pool_client and leading_zeros >= POOL_SHARE_DIFFICULTY:
             pool_client.submit_share(found_nonce[0], hash_hex, leading_zeros)
         
-        # Continue mining unless we found the ultimate solution
-        if leading_zeros >= TARGET_LEADING_ZEROS:
-            break
 
 if current_nonce > domain_max:
     print("\n⚠️  Exhausted nonce range without finding solution")
